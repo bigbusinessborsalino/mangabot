@@ -1,0 +1,4 @@
+python-telegram-bot>=22.7
+mangaplus>=2.1.2
+pillow>=12.1.1
+requests>=2.33.1
