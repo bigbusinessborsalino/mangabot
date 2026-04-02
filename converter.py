@@ -24,25 +24,33 @@ def create_pdf(image_paths: list[str], output_path: str) -> str:
     if not image_paths:
         raise ValueError("No images to convert to PDF")
 
-    images = []
-    for p in sorted(image_paths):
-        try:
-            images.append(_load_image_rgb(p))
-        except Exception as e:
-            logger.warning(f"Skipping {p}: {e}")
+    sorted_paths = sorted(image_paths)
+    
+    # Load ONLY the very first image into memory
+    try:
+        first_image = _load_image_rgb(sorted_paths[0])
+    except Exception as e:
+        logger.warning(f"Skipping first image {sorted_paths[0]}: {e}")
+        raise ValueError("Failed to load the first image for PDF.")
 
-    if not images:
-        raise ValueError("No valid images found for PDF conversion")
+    # Create a GENERATOR for the rest of the images. 
+    # This loads them into RAM one-by-one exactly when the PDF needs them, preventing server crashes.
+    def image_generator():
+        for p in sorted_paths[1:]:
+            try:
+                yield _load_image_rgb(p)
+            except Exception as e:
+                logger.warning(f"Skipping {p}: {e}")
 
-    first = images[0]
-    rest = images[1:]
-    first.save(
+    # Save the PDF using the generator
+    first_image.save(
         output_path,
         format="PDF",
         save_all=True,
-        append_images=rest,
+        append_images=image_generator(),
         resolution=150,
     )
+    
     logger.info(f"PDF created: {output_path} ({os.path.getsize(output_path) / 1024 / 1024:.1f} MB)")
     return output_path
 
