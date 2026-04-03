@@ -10,7 +10,6 @@ from PIL import Image
 
 logger = logging.getLogger(__name__)
 
-
 def _to_jpeg(src_path: str, dst_path: str) -> None:
     """Convert any image (WebP/PNG/etc.) to JPEG, releasing memory immediately."""
     with Image.open(src_path) as img:
@@ -24,14 +23,7 @@ def _to_jpeg(src_path: str, dst_path: str) -> None:
             rgb = img.convert("RGB")
         rgb.save(dst_path, "JPEG", quality=85, optimize=True, progressive=True)
 
-
 def create_pdf(image_paths: list[str], output_path: str) -> str:
-    """
-    Memory-efficient PDF creation:
-    1. Convert each source image → JPEG one at a time (single decode, then free)
-    2. img2pdf streams the JPEG bytes directly into the PDF — no full decode needed
-    Peak RAM ~ 1 decoded image + output file, regardless of chapter length.
-    """
     if not image_paths:
         raise ValueError("No images to convert to PDF")
 
@@ -51,8 +43,14 @@ def create_pdf(image_paths: list[str], output_path: str) -> str:
         raise ValueError("No valid images could be converted for PDF")
 
     try:
+        # Build PDF in memory, write it, then force delete it
+        pdf_bytes = img2pdf.convert(jpeg_paths)
         with open(output_path, "wb") as f:
-            f.write(img2pdf.convert(jpeg_paths))
+            f.write(pdf_bytes)
+            
+        del pdf_bytes  # <--- CRITICAL RAM SAVER
+        gc.collect()
+        
     finally:
         for p in jpeg_paths:
             try:
@@ -71,10 +69,10 @@ def create_cbz(image_paths: list[str], output_path: str) -> str:
     if not image_paths:
         raise ValueError("No images to create CBZ")
 
-    with zipfile.ZipFile(output_path, "w", zipfile.ZIP_STORED) as zf:
+    with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as z:
         for p in sorted(image_paths):
-            zf.write(p, os.path.basename(p))
+            z.write(p, arcname=os.path.basename(p))
 
     size_mb = os.path.getsize(output_path) / 1024 / 1024
-    logger.info(f"CBZ created: {output_path} ({size_mb:.1f} MB)")
+    logger.info(f"CBZ created: {output_path} ({size_mb:.1f} MB, {len(image_paths)} pages)")
     return output_path
