@@ -1,68 +1,80 @@
+import gc
 import os
+import re
 import zipfile
 import logging
+import tempfile
+
+import img2pdf
 from PIL import Image
 
 logger = logging.getLogger(__name__)
 
 
-def _load_image_rgb(path: str) -> Image.Image:
-    img = Image.open(path)
-    if img.mode in ("RGBA", "P", "LA"):
-        bg = Image.new("RGB", img.size, (255, 255, 255))
-        if img.mode == "P":
-            img = img.convert("RGBA")
-        if img.mode in ("RGBA", "LA"):
-            bg.paste(img, mask=img.split()[-1])
+def _to_jpeg(src_path: str, dst_path: str) -> None:
+    """Convert any image (WebP/PNG/etc.) to JPEG, releasing memory immediately."""
+    with Image.open(src_path) as img:
+        if img.mode in ("RGBA", "P", "LA"):
+            bg = Image.new("RGB", img.size, (255, 255, 255))
+            if img.mode == "P":
+                img = img.convert("RGBA")
+            bg.paste(img, mask=img.split()[-1] if img.mode in ("RGBA", "LA") else None)
+            rgb = bg
         else:
-            bg.paste(img)
-        return bg
-    return img.convert("RGB")
+            rgb = img.convert("RGB")
+        rgb.save(dst_path, "JPEG", quality=85, optimize=True, progressive=True)
 
 
 def create_pdf(image_paths: list[str], output_path: str) -> str:
+    """
+    Memory-efficient PDF creation:
+    1. Convert each source image → JPEG one at a time (single decode, then free)
+    2. img2pdf streams the JPEG bytes directly into the PDF — no full decode needed
+    Peak RAM ~ 1 decoded image + output file, regardless of chapter length.
+    """
     if not image_paths:
         raise ValueError("No images to convert to PDF")
 
-    sorted_paths = sorted(image_paths)
-    
-    # Load ONLY the very first image into memory
+    jpeg_paths: list[str] = []
+    tmp_dir = os.path.dirname(output_path)
+
+    for i, src in enumerate(sorted(image_paths)):
+        dst = os.path.join(tmp_dir, f"_conv_{i:04d}.jpg")
+        try:
+            _to_jpeg(src, dst)
+            jpeg_paths.append(dst)
+        except Exception as ex:
+            logger.warning(f"Skipping page {i} ({src}): {ex}")
+        gc.collect()
+
+    if not jpeg_paths:
+        raise ValueError("No valid images could be converted for PDF")
+
     try:
-        first_image = _load_image_rgb(sorted_paths[0])
-    except Exception as e:
-        logger.warning(f"Skipping first image {sorted_paths[0]}: {e}")
-        raise ValueError("Failed to load the first image for PDF.")
-
-    # Create a GENERATOR for the rest of the images. 
-    # This loads them into RAM one-by-one exactly when the PDF needs them, preventing server crashes.
-    def image_generator():
-        for p in sorted_paths[1:]:
+        with open(output_path, "wb") as f:
+            f.write(img2pdf.convert(jpeg_paths))
+    finally:
+        for p in jpeg_paths:
             try:
-                yield _load_image_rgb(p)
-            except Exception as e:
-                logger.warning(f"Skipping {p}: {e}")
+                os.remove(p)
+            except OSError:
+                pass
+        gc.collect()
 
-    # Save the PDF using the generator
-    first_image.save(
-        output_path,
-        format="PDF",
-        save_all=True,
-        append_images=image_generator(),
-        resolution=150,
-    )
-    
-    logger.info(f"PDF created: {output_path} ({os.path.getsize(output_path) / 1024 / 1024:.1f} MB)")
+    size_mb = os.path.getsize(output_path) / 1024 / 1024
+    logger.info(f"PDF created: {output_path} ({size_mb:.1f} MB, {len(jpeg_paths)} pages)")
     return output_path
 
 
 def create_cbz(image_paths: list[str], output_path: str) -> str:
+    """CBZ is just a zip of images — no decoding needed, already low memory."""
     if not image_paths:
         raise ValueError("No images to create CBZ")
 
-    with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zf:
+    with zipfile.ZipFile(output_path, "w", zipfile.ZIP_STORED) as zf:
         for p in sorted(image_paths):
-            arcname = os.path.basename(p)
-            zf.write(p, arcname)
+            zf.write(p, os.path.basename(p))
 
-    logger.info(f"CBZ created: {output_path} ({os.path.getsize(output_path) / 1024 / 1024:.1f} MB)")
+    size_mb = os.path.getsize(output_path) / 1024 / 1024
+    logger.info(f"CBZ created: {output_path} ({size_mb:.1f} MB)")
     return output_path
