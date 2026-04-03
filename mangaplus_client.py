@@ -79,7 +79,7 @@ class MangaPlusClient:
         # Next chapter release date from Unix timestamp
         next_ts = tdv.get("nextTimeStamp", 0) or 0
         next_chapter_date = ""
-        if next_ts and next_ts > 0:
+        if next_ts and int(next_ts) > 0:
             try:
                 dt = datetime.fromtimestamp(int(next_ts), tz=timezone.utc)
                 next_chapter_date = dt.strftime("%B %d, %Y")
