@@ -1,7 +1,9 @@
+import gc
 import os
 import re
 import logging
 import requests
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +27,7 @@ class MangaPlusClient:
         return self._client
 
     def search_manga(self, query: str) -> list[dict]:
-        """Search across all title types. Returns list of {titleId, name, author, language}."""
+        """Search across all title types. Returns list of {title_id, name, author, language}."""
         from mangaplus.constants import TitleType
         client = self._get_client()
         query_lower = query.lower().strip()
@@ -44,17 +46,15 @@ class MangaPlusClient:
                             continue
                         if query_lower in name.lower():
                             seen_ids.add(tid)
-                            lang = t.get("language", "ENGLISH")
                             results.append({
                                 "title_id": tid,
                                 "name": name,
                                 "author": t.get("author", ""),
-                                "language": lang,
+                                "language": t.get("language", "ENGLISH"),
                             })
             except Exception as ex:
                 logger.error(f"Error fetching {title_type}: {ex}")
 
-        # Sort: English first, then by exact match, then alphabetical
         def sort_key(r):
             is_english = 0 if r["language"] == "ENGLISH" else 1
             is_exact = 0 if r["name"].lower() == query_lower else 1
@@ -64,27 +64,34 @@ class MangaPlusClient:
         return results[:15]
 
     def get_title_info(self, title_id: int) -> dict:
-        """Returns {title_name, chapters: [{chapter_id, chapter_num, sub_title}]}."""
+        """Returns title info including chapters and next chapter release date."""
         client = self._get_client()
         detail = client.getTitleDetail(title_id=title_id)
         tdv = detail.get("titleDetailView", {})
 
-        # Title name
         title_obj = tdv.get("title", {})
         title_name = title_obj.get("name", "") if isinstance(title_obj, dict) else ""
 
-        # Portrait/cover image
         portrait_url = ""
         if isinstance(title_obj, dict):
             portrait_url = title_obj.get("portraitImageUrl", "")
 
-        # Chapters — flat list in chapterListV2
+        # Next chapter release date from Unix timestamp
+        next_ts = tdv.get("nextTimeStamp", 0) or 0
+        next_chapter_date = ""
+        if next_ts and next_ts > 0:
+            try:
+                dt = datetime.fromtimestamp(int(next_ts), tz=timezone.utc)
+                next_chapter_date = dt.strftime("%B %d, %Y")
+            except Exception:
+                pass
+
         raw_chapters = tdv.get("chapterListV2", [])
         chapters = []
         for ch in raw_chapters:
             cid = ch.get("chapterId")
-            name = ch.get("name", "")         # e.g. "#001"
-            subtitle = ch.get("subTitle", "") # e.g. "Chapter 1: Romance Dawn"
+            name = ch.get("name", "")
+            subtitle = ch.get("subTitle", "")
             num = _parse_chapter_number(name) or _parse_chapter_number(subtitle)
             if cid is not None:
                 chapters.append({
@@ -95,7 +102,12 @@ class MangaPlusClient:
                     "thumbnail_url": ch.get("thumbnailUrl", ""),
                 })
 
-        return {"title_name": title_name, "portrait_url": portrait_url, "chapters": chapters}
+        return {
+            "title_name": title_name,
+            "portrait_url": portrait_url,
+            "next_chapter_date": next_chapter_date,
+            "chapters": chapters,
+        }
 
     def find_chapter(self, title_id: int, chapter_number: float) -> dict | None:
         info = self.get_title_info(title_id)
@@ -106,13 +118,14 @@ class MangaPlusClient:
                     if abs(float(num) - chapter_number) < 0.01:
                         ch["title_name"] = info["title_name"]
                         ch["portrait_url"] = info.get("portrait_url", "")
+                        ch["next_chapter_date"] = info.get("next_chapter_date", "")
                         return ch
                 except (TypeError, ValueError):
                     pass
         return None
 
     def download_chapter_images(self, chapter_id: int, output_dir: str) -> list[str]:
-        """Download all pages for a chapter. Returns sorted list of local file paths."""
+        """Download all pages one at a time to disk. Returns sorted list of file paths."""
         from mangaplus.constants import Quality
         client = self._get_client()
         data = client.getMangaData(chapter_id=chapter_id, quality=Quality.SUPER_HIGH)
@@ -128,7 +141,7 @@ class MangaPlusClient:
         for page in raw_pages:
             mp = page.get("mangaPage")
             if not mp:
-                continue  # skip non-image pages (ads, blanks)
+                continue
             url = mp.get("imageUrl")
             if not url:
                 continue
@@ -140,38 +153,36 @@ class MangaPlusClient:
                 with open(path, "wb") as f:
                     f.write(img_bytes)
                 image_paths.append(path)
-                logger.info(f"Page {img_index}: {len(img_bytes)} bytes")
+                logger.info(f"Page {img_index}: {len(img_bytes)} bytes → {ext}")
                 img_index += 1
+                del img_bytes
+                gc.collect()
             else:
-                logger.warning(f"Failed to download page from {url}")
+                logger.warning(f"Failed to download page {img_index}")
 
         if not image_paths:
             raise ValueError(
-                "No pages downloaded. This chapter may be subscriber-only or unavailable in your region."
+                "No pages downloaded. This chapter may be subscriber-only or unavailable."
             )
 
         return sorted(image_paths)
 
 
 def _parse_chapter_number(s: str) -> float | None:
-    """Extract chapter number from strings like '#001', 'Chapter 1: ...', '#1176'."""
     if not s:
         return None
-    # Match leading # followed by digits
     m = re.search(r"#(\d+(?:\.\d+)?)", s)
     if m:
         try:
             return float(m.group(1))
         except ValueError:
             pass
-    # Match 'Chapter N' pattern
     m = re.search(r"[Cc]hapter\s+(\d+(?:\.\d+)?)", s)
     if m:
         try:
             return float(m.group(1))
         except ValueError:
             pass
-    # Match standalone number
     m = re.match(r"^(\d+(?:\.\d+)?)$", s.strip())
     if m:
         try:
@@ -194,7 +205,7 @@ def _http_get(url: str) -> bytes | None:
         )
         if r.status_code == 200:
             return r.content
-        logger.warning(f"HTTP {r.status_code} for URL")
+        logger.warning(f"HTTP {r.status_code} for {url[:80]}")
     except Exception as ex:
         logger.error(f"HTTP error: {ex}")
     return None
@@ -205,8 +216,6 @@ def _detect_ext(data: bytes) -> str:
         return "jpg"
     if data[:8] == b"\x89PNG\r\n\x1a\n":
         return "png"
-    if data[:6] in (b"GIF87a", b"GIF89a"):
-        return "gif"
     if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
         return "webp"
-    return "webp"  # MangaPlus uses webp by default
+    return "webp"
