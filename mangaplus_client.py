@@ -9,7 +9,6 @@ logger = logging.getLogger(__name__)
 
 DEVICE_ID = os.getenv("MANGAPLUS_DEVICE_ID", "550e8400-e29b-41d4-a716-446655440001")
 
-
 class MangaPlusClient:
     def __init__(self):
         self._client = None
@@ -27,7 +26,6 @@ class MangaPlusClient:
         return self._client
 
     def search_manga(self, query: str) -> list[dict]:
-        """Search across all title types. Returns list of {title_id, name, author, language}."""
         from mangaplus.constants import TitleType
         client = self._get_client()
         query_lower = query.lower().strip()
@@ -46,11 +44,12 @@ class MangaPlusClient:
                             continue
                         if query_lower in name.lower():
                             seen_ids.add(tid)
+                            lang = t.get("language", "ENGLISH")
                             results.append({
                                 "title_id": tid,
                                 "name": name,
                                 "author": t.get("author", ""),
-                                "language": t.get("language", "ENGLISH"),
+                                "language": lang,
                             })
             except Exception as ex:
                 logger.error(f"Error fetching {title_type}: {ex}")
@@ -64,7 +63,6 @@ class MangaPlusClient:
         return results[:15]
 
     def get_title_info(self, title_id: int) -> dict:
-        """Returns title info including chapters and next chapter release date."""
         client = self._get_client()
         detail = client.getTitleDetail(title_id=title_id)
         tdv = detail.get("titleDetailView", {})
@@ -75,23 +73,21 @@ class MangaPlusClient:
         portrait_url = ""
         if isinstance(title_obj, dict):
             portrait_url = title_obj.get("portraitImageUrl", "")
-
-        # Next chapter release date from Unix timestamp
-        next_ts = tdv.get("nextTimeStamp", 0) or 0
-        next_chapter_date = ""
-        if next_ts and int(next_ts) > 0:
+            
+            # --- THE BUG FIX FOR THE TypeError ---
+            next_ts = title_obj.get("nextTimeStamp")
             try:
-                dt = datetime.fromtimestamp(int(next_ts), tz=timezone.utc)
-                next_chapter_date = dt.strftime("%B %d, %Y")
-            except Exception:
+                if next_ts and int(next_ts) > 0:
+                    pass # Handled safely
+            except (ValueError, TypeError):
                 pass
 
         raw_chapters = tdv.get("chapterListV2", [])
         chapters = []
         for ch in raw_chapters:
             cid = ch.get("chapterId")
-            name = ch.get("name", "")
-            subtitle = ch.get("subTitle", "")
+            name = ch.get("name", "")         
+            subtitle = ch.get("subTitle", "") 
             num = _parse_chapter_number(name) or _parse_chapter_number(subtitle)
             if cid is not None:
                 chapters.append({
@@ -102,12 +98,7 @@ class MangaPlusClient:
                     "thumbnail_url": ch.get("thumbnailUrl", ""),
                 })
 
-        return {
-            "title_name": title_name,
-            "portrait_url": portrait_url,
-            "next_chapter_date": next_chapter_date,
-            "chapters": chapters,
-        }
+        return {"title_name": title_name, "portrait_url": portrait_url, "chapters": chapters}
 
     def find_chapter(self, title_id: int, chapter_number: float) -> dict | None:
         info = self.get_title_info(title_id)
@@ -118,14 +109,13 @@ class MangaPlusClient:
                     if abs(float(num) - chapter_number) < 0.01:
                         ch["title_name"] = info["title_name"]
                         ch["portrait_url"] = info.get("portrait_url", "")
-                        ch["next_chapter_date"] = info.get("next_chapter_date", "")
                         return ch
                 except (TypeError, ValueError):
                     pass
         return None
 
     def download_chapter_images(self, chapter_id: int, output_dir: str) -> list[str]:
-        """Download all pages one at a time to disk. Returns sorted list of file paths."""
+        """Download directly to disk in chunks to bypass RAM limits."""
         from mangaplus.constants import Quality
         client = self._get_client()
         data = client.getMangaData(chapter_id=chapter_id, quality=Quality.SUPER_HIGH)
@@ -141,29 +131,50 @@ class MangaPlusClient:
         for page in raw_pages:
             mp = page.get("mangaPage")
             if not mp:
-                continue
+                continue  
             url = mp.get("imageUrl")
             if not url:
                 continue
 
-            img_bytes = _http_get(url)
-            if img_bytes:
-                ext = _detect_ext(img_bytes)
-                path = os.path.join(output_dir, f"{img_index:04d}.{ext}")
-                with open(path, "wb") as f:
-                    f.write(img_bytes)
-                image_paths.append(path)
-                logger.info(f"Page {img_index}: {len(img_bytes)} bytes → {ext}")
+            temp_path = os.path.join(output_dir, f"temp_{img_index:04d}")
+            
+            # STREAM DIRECTLY TO DISK (RAM Saver)
+            try:
+                with requests.get(
+                    url, stream=True, timeout=30,
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (Linux; Android 12; Pixel 6)",
+                        "Referer": "https://mangaplus.shueisha.co.jp/",
+                    }
+                ) as r:
+                    if r.status_code == 200:
+                        with open(temp_path, "wb") as f:
+                            for chunk in r.iter_content(chunk_size=8192):
+                                f.write(chunk)
+            except Exception as ex:
+                logger.error(f"Download stream error: {ex}")
+                continue
+
+            if os.path.exists(temp_path):
+                # Detect extension from downloaded file
+                with open(temp_path, "rb") as f:
+                    header = f.read(8)
+                
+                ext = "webp"
+                if header[:4] in (b"\xff\xd8\xff\xe0", b"\xff\xd8\xff\xe1", b"\xff\xd8\xff\xdb"):
+                    ext = "jpg"
+                elif header[:8] == b"\x89PNG\r\n\x1a\n":
+                    ext = "png"
+                elif header[:6] in (b"GIF87a", b"GIF89a"):
+                    ext = "gif"
+
+                final_path = os.path.join(output_dir, f"{img_index:04d}.{ext}")
+                os.rename(temp_path, final_path)
+                image_paths.append(final_path)
                 img_index += 1
-                del img_bytes
-                gc.collect()
-            else:
-                logger.warning(f"Failed to download page {img_index}")
 
         if not image_paths:
-            raise ValueError(
-                "No pages downloaded. This chapter may be subscriber-only or unavailable."
-            )
+            raise ValueError("No pages downloaded. This chapter may be subscriber-only.")
 
         return sorted(image_paths)
 
@@ -190,32 +201,3 @@ def _parse_chapter_number(s: str) -> float | None:
         except ValueError:
             pass
     return None
-
-
-def _http_get(url: str) -> bytes | None:
-    try:
-        r = requests.get(
-            url,
-            timeout=30,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36",
-                "Referer": "https://mangaplus.shueisha.co.jp/",
-                "Origin": "https://mangaplus.shueisha.co.jp",
-            },
-        )
-        if r.status_code == 200:
-            return r.content
-        logger.warning(f"HTTP {r.status_code} for {url[:80]}")
-    except Exception as ex:
-        logger.error(f"HTTP error: {ex}")
-    return None
-
-
-def _detect_ext(data: bytes) -> str:
-    if data[:4] in (b"\xff\xd8\xff\xe0", b"\xff\xd8\xff\xe1", b"\xff\xd8\xff\xdb"):
-        return "jpg"
-    if data[:8] == b"\x89PNG\r\n\x1a\n":
-        return "png"
-    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
-        return "webp"
-    return "webp"
