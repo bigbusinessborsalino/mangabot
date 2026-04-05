@@ -469,7 +469,7 @@ def start_dummy_server():
     port = int(os.environ.get("PORT", 8080))
     server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    logger.info(f"🌍 Dummy Web Server started on port {port}"))
+    logger.info(f"🌍 Dummy Web Server started on port {port}")
 
 
 def main() -> None:
