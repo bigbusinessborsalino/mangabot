@@ -455,11 +455,21 @@ def start_dummy_server():
             self.send_header('Content-type', 'text/plain')
             self.end_headers()
             self.wfile.write(b"Manga Worker Bot is Alive and Ready!")
+            
+        def do_HEAD(self):
+            """Handles HEAD requests which some uptime monitors use."""
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+
+        def log_message(self, format, *args):
+            """Prevents UptimeRobot from spamming your Render logs every 5 minutes."""
+            pass
 
     port = int(os.environ.get("PORT", 8080))
     server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    logger.info(f"🌍 Dummy Web Server started on port {port}")
+    logger.info(f"🌍 Dummy Web Server started on port {port}"))
 
 
 def main() -> None:
